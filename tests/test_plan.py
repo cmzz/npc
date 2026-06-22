@@ -108,8 +108,14 @@ def test_check_ready_exit0(make_args, capsys, _repo, _has_openspec):
             ],
         }
     )
-    # ready → 不抛 SystemExit（退出码 0 = 正常返回）
-    _plan.run_check(_check_args(make_args), runner=_fake_run(0, stdout=stdout))
+    # ready → 不抛 SystemExit（退出码 0 = 正常返回），且 argv 含 --change <id>
+    captured = {}
+
+    def _runner(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    _plan.run_check(_check_args(make_args), runner=_runner)
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
     assert out["ready"] is True
@@ -117,6 +123,35 @@ def test_check_ready_exit0(make_args, capsys, _repo, _has_openspec):
     assert out["phase"] == "implement"
     assert out["apply_requires"] == ["spec", "tasks"]
     assert out["missing"] == []
+    # happy path 也断言 argv 形态正确（--change 紧跟 change-id）
+    argv = captured["argv"]
+    assert "--change" in argv
+    assert argv[argv.index("--change") + 1] == "add-foo"
+
+
+def test_check_leading_dash_change_exit2(make_args, capsys, _repo, _has_openspec):
+    # change 以 '-' 开头 → 参数注入防护，exit 2，且不应调用 runner
+    def _boom_runner(argv, **kwargs):
+        raise AssertionError("runner 不应被调用")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_check(_check_args(make_args, change="--force"), runner=_boom_runner)
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+def test_check_subprocess_oserror_json_intact(make_args, capsys, _repo, _has_openspec):
+    # runner 抛 OSError → 不裸抛、JSON 契约不崩，exit 1
+    def _raises(argv, **kwargs):
+        raise OSError("boom: no such file")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_check(_check_args(make_args), runner=_raises)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "subprocess_error"
 
 
 def test_check_not_ready_exit1_with_missing(make_args, capsys, _repo, _has_openspec):
@@ -305,6 +340,69 @@ def test_new_change_non_git_repo_exit3(make_args, capsys, _has_openspec, monkeyp
     assert ei.value.code == 3
     out = json.loads(capsys.readouterr().out)
     assert out["error"] == "env_missing"
+
+
+def test_new_change_leading_dash_change_exit2(make_args, capsys, _repo, _has_openspec):
+    def _boom_runner(argv, **kwargs):
+        raise AssertionError("runner 不应被调用")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_new_change(
+            _new_args(make_args, change="--evil"), runner=_boom_runner
+        )
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+def test_new_change_leading_dash_description_exit2(make_args, capsys, _repo, _has_openspec):
+    def _boom_runner(argv, **kwargs):
+        raise AssertionError("runner 不应被调用")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_new_change(
+            _new_args(make_args, description="--inject"), runner=_boom_runner
+        )
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+def test_new_change_leading_dash_schema_exit2(make_args, capsys, _repo, _has_openspec):
+    def _boom_runner(argv, **kwargs):
+        raise AssertionError("runner 不应被调用")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_new_change(
+            _new_args(make_args, schema="--inject"), runner=_boom_runner
+        )
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+@pytest.mark.parametrize("bad", ["../escape", "foo/bar", "a/../b", ".."])
+def test_new_change_path_traversal_exit2(make_args, capsys, _repo, _has_openspec, bad):
+    def _boom_runner(argv, **kwargs):
+        raise AssertionError("runner 不应被调用")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_new_change(_new_args(make_args, change=bad), runner=_boom_runner)
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+def test_new_change_subprocess_oserror_json_intact(make_args, capsys, _repo, _has_openspec):
+    def _raises(argv, **kwargs):
+        raise OSError("boom: cannot exec")
+
+    with pytest.raises(SystemExit) as ei:
+        _plan.run_new_change(_new_args(make_args), runner=_raises)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "subprocess_error"
 
 
 def test_new_change_empty_dir_lists_no_files(make_args, capsys, _repo, _has_openspec):

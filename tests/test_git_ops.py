@@ -118,6 +118,67 @@ def test_parse_porcelain_rename_takes_new_path():
     assert _git.parse_porcelain(out) == ["new.py"]
 
 
+def test_parse_porcelain_z_basic():
+    # -z 用 NUL 分隔，路径原样（不加引号）
+    out = " M src/a.py\x00?? new.txt\x00A  staged.py\x00"
+    assert _git.parse_porcelain(out) == ["src/a.py", "new.txt", "staged.py"]
+
+
+def test_parse_porcelain_z_path_with_space():
+    # 含空格的路径在 -z 模式下原样保留，不被截断
+    out = ' M src/with space.py\x00?? a b c.txt\x00'
+    assert _git.parse_porcelain(out) == ["src/with space.py", "a b c.txt"]
+
+
+def test_parse_porcelain_z_rename_skips_old_path():
+    # -z 下重命名形如 "R  new\0old\0"，old 侧需跳过
+    out = "R  new name.py\x00old name.py\x00 M other.py\x00"
+    assert _git.parse_porcelain(out) == ["new name.py", "other.py"]
+
+
+def test_parse_porcelain_lines_quoted_path_unquoted():
+    # 回退（无 NUL）：带引号的路径去掉首尾引号
+    out = '?? "weird path.txt"\n'
+    assert _git.parse_porcelain(out) == ["weird path.txt"]
+
+
+# ============================================================
+# 纯函数：change-id / commit message 校验
+# ============================================================
+
+
+def test_validate_change_id_accepts_safe():
+    assert _git._validate_change_id("add-foo") is True
+    assert _git._validate_change_id("a.b_c-1") is True
+
+
+def test_validate_change_id_rejects_dotdot():
+    assert _git._validate_change_id("../etc") is False
+    assert _git._validate_change_id("a..b") is False
+
+
+def test_validate_change_id_rejects_leading_dash():
+    assert _git._validate_change_id("-rf") is False
+
+
+def test_validate_change_id_rejects_space_and_special():
+    assert _git._validate_change_id("a b") is False
+    assert _git._validate_change_id("a;rm") is False
+    assert _git._validate_change_id("") is False
+
+
+def test_branch_name_for_rejects_invalid():
+    with pytest.raises(ValueError):
+        _git.branch_name_for("../evil")
+
+
+def test_is_safe_commit_message():
+    assert _git._is_safe_commit_message("feat: ok") is True
+    assert _git._is_safe_commit_message("line1\nline2") is False
+    assert _git._is_safe_commit_message("-rf") is False
+    assert _git._is_safe_commit_message("#comment") is False
+
+
 # ============================================================
 # branch-for handler
 # ============================================================
@@ -196,6 +257,45 @@ def test_branch_for_checkout_failure_exit_1(tmp_path, make_args, capsys, monkeyp
     assert "boom" in out["stderr"]
 
 
+def test_branch_for_invalid_change_id_dotdot_exit_2(make_args, capsys, monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_branch_for(make_args(change="../evil"), runner=ScriptedRunner())
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "invalid_args"
+
+
+def test_branch_for_invalid_change_id_leading_dash_exit_2(make_args, capsys, monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_branch_for(make_args(change="-rf"), runner=ScriptedRunner())
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+def test_branch_for_invalid_change_id_space_exit_2(make_args, capsys, monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_branch_for(make_args(change="a b"), runner=ScriptedRunner())
+    assert ei.value.code == 2
+
+
+def test_branch_for_oserror_emits_json_exit_3(tmp_path, make_args, capsys, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _patch_repo(monkeypatch, repo)
+
+    def _boom_runner(cmd, **kwargs):
+        raise OSError("git binary not found")
+
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_branch_for(make_args(change="add-foo"), runner=_boom_runner)
+    assert ei.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "git_error"
+
+
 def test_branch_for_not_a_repo_exit_3(make_args, capsys, monkeypatch):
     def _boom(args):
         raise _paths.PathsError("not a git repo")
@@ -242,6 +342,53 @@ def test_ensure_clean_when_dirty_exit_1(tmp_path, make_args, capsys, monkeypatch
     assert out["ok"] is False
     assert out["clean"] is False
     assert out["dirty_files"] == ["src/a.py", "b.txt"]
+
+
+def test_ensure_clean_status_failure_exit_1(tmp_path, make_args, capsys, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _patch_repo(monkeypatch, repo)
+    # git status 失败（returncode≠0）绝不能被当作 clean
+    runner = ScriptedRunner(
+        rules=[(lambda c: "status" in c, lambda c: _completed(c, 128, stderr="fatal: boom"))]
+    )
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_ensure_clean(make_args(), runner=runner)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "git_status_failed"
+    assert "boom" in out["stderr"]
+
+
+def test_ensure_clean_oserror_exit_3(tmp_path, make_args, capsys, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _patch_repo(monkeypatch, repo)
+
+    def _boom_runner(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_ensure_clean(make_args(), runner=_boom_runner)
+    assert ei.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "git_error"
+
+
+def test_ensure_clean_dirty_z_path_with_space(tmp_path, make_args, capsys, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _patch_repo(monkeypatch, repo)
+    porcelain = " M src/with space.py\x00?? b c.txt\x00"
+    runner = ScriptedRunner(
+        rules=[(lambda c: "status" in c, lambda c: _completed(c, 0, stdout=porcelain))]
+    )
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_ensure_clean(make_args(), runner=runner)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["dirty_files"] == ["src/with space.py", "b c.txt"]
 
 
 def test_ensure_clean_not_a_repo_exit_3(make_args, capsys, monkeypatch):
@@ -361,6 +508,45 @@ def test_commit_add_failure_exit_1(tmp_path, make_args, capsys, monkeypatch):
     assert ei.value.code == 1
     out = json.loads(capsys.readouterr().out)
     assert out["error"] == "git_add_failed"
+
+
+def test_commit_message_with_newline_rejected_exit_2(make_args, capsys, monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_commit(
+            make_args(message="line1\nline2", change=None, phase=None),
+            runner=ScriptedRunner(),
+        )
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "invalid_args"
+
+
+def test_commit_message_leading_dash_rejected_exit_2(make_args, capsys, monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_commit(
+            make_args(message="-rf boom", change=None, phase=None),
+            runner=ScriptedRunner(),
+        )
+    assert ei.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "invalid_args"
+
+
+def test_commit_oserror_emits_json_exit_3(tmp_path, make_args, capsys, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _patch_repo(monkeypatch, repo)
+
+    def _boom_runner(cmd, **kwargs):
+        raise OSError("git binary not found")
+
+    with pytest.raises(SystemExit) as ei:
+        _git.cli_commit(make_args(message="x", change=None, phase=None), runner=_boom_runner)
+    assert ei.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "git_error"
 
 
 def test_commit_not_a_repo_exit_3(make_args, capsys, monkeypatch):

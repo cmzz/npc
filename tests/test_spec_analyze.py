@@ -96,6 +96,27 @@ def test_parse_new_capabilities_none_when_absent():
     assert _sa.parse_new_capabilities("# Proposal\n\nno caps section\n") == []
 
 
+def test_parse_new_capabilities_extended_heading_not_matched():
+    # `### New Capabilities Extended` 不是 New Capabilities 段，不应激活收集
+    text = (
+        "## Capabilities\n\n### New Capabilities Extended\n\n"
+        "- `should-not-collect`: nope\n"
+    )
+    assert _sa.parse_new_capabilities(text) == []
+
+
+def test_parse_new_capabilities_case_insensitive_heading():
+    # 大小写标题 `### NEW CAPABILITIES` 同样激活
+    text = "## Capabilities\n\n### NEW CAPABILITIES\n\n- `cap-x`: yes\n"
+    assert _sa.parse_new_capabilities(text) == ["cap-x"]
+
+
+def test_parse_new_capabilities_star_bullet():
+    # `* \`name\`` 星号 bullet 同样收集
+    text = "### New Capabilities\n\n* `star-cap`: via asterisk\n"
+    assert _sa.parse_new_capabilities(text) == ["star-cap"]
+
+
 # ============================================================
 # 纯函数：parse_requirements
 # ============================================================
@@ -137,6 +158,20 @@ def test_parse_tasks_empty():
     assert _sa.parse_tasks("## only heading\n\nprose\n") == []
 
 
+def test_parse_tasks_star_bullet():
+    # `* [ ]` 星号 bullet 的任务项也认
+    tasks = _sa.parse_tasks("* [ ] star open\n* [x] star done\n")
+    assert tasks == [
+        {"done": False, "text": "star open"},
+        {"done": True, "text": "star done"},
+    ]
+
+
+def test_parse_tasks_empty_text():
+    # 复选框后无文本：text 为空字符串，仍是合法任务项
+    assert _sa.parse_tasks("- [ ] \n") == [{"done": False, "text": ""}]
+
+
 # ============================================================
 # 纯函数：capability_mentioned_in_tasks（覆盖启发式）
 # ============================================================
@@ -158,6 +193,17 @@ def test_capability_mentioned_token_match():
     # 任一非平凡 token 命中即算提到
     assert _sa.capability_mentioned_in_tasks(
         "drift-gate", "- [ ] add a gate for tasks\n"
+    )
+
+
+def test_capability_mentioned_short_name_word_boundary():
+    # 短名 "no"（无 ≥3 token，走回退分支）不应子串命中 "not"
+    assert not _sa.capability_mentioned_in_tasks(
+        "no", "- [ ] do not break the build\n"
+    )
+    # 但作为独立词时应命中
+    assert _sa.capability_mentioned_in_tasks(
+        "no", "- [ ] wire up no op handler\n"
     )
 
 
@@ -211,6 +257,57 @@ def test_analyze_no_tasks_empty_file(tmp_path):
     res = _sa.analyze_change(cd)
     assert res["tasks_count"] == 0
     assert any(f["kind"] == "no-tasks" for f in res["findings"])
+
+
+def test_analyze_no_tasks_no_maybe_uncovered_noise(tmp_path):
+    # tasks 缺失时只报 no-tasks，不叠加误导性的 requirement-maybe-uncovered
+    repo = tmp_path / "repo"
+    cd = _make_change(
+        repo,
+        "c",
+        proposal=_proposal("cap"),
+        specs={"cap": _spec("Some Requirement")},
+        # tasks 缺失
+    )
+    res = _sa.analyze_change(cd)
+    kinds = {f["kind"] for f in res["findings"]}
+    assert "no-tasks" in kinds
+    assert "requirement-maybe-uncovered" not in kinds
+
+
+def test_analyze_empty_tasks_no_maybe_uncovered_noise(tmp_path):
+    # tasks 文件存在但无任务项：同样不叠加 requirement-maybe-uncovered
+    repo = tmp_path / "repo"
+    cd = _make_change(
+        repo,
+        "c",
+        proposal=_proposal("cap"),
+        specs={"cap": _spec("Some Requirement")},
+        tasks="## 1. group\n\njust prose, no checkboxes\n",
+    )
+    res = _sa.analyze_change(cd)
+    kinds = {f["kind"] for f in res["findings"]}
+    assert "no-tasks" in kinds
+    assert "requirement-maybe-uncovered" not in kinds
+
+
+def test_analyze_html_comment_not_parsed_as_task(tmp_path):
+    # HTML 注释里的假任务条目不应被当作真任务解析
+    repo = tmp_path / "repo"
+    tasks = (
+        "## 1. group\n\n"
+        "<!-- - [ ] fake commented task -->\n"
+        "- [ ] 1.1 real task\n"
+    )
+    cd = _make_change(
+        repo,
+        "c",
+        proposal=_proposal("cap"),
+        specs={"cap": _spec("R cap")},
+        tasks=tasks,
+    )
+    res = _sa.analyze_change(cd)
+    assert res["tasks_count"] == 1
 
 
 def test_analyze_capability_no_spec(tmp_path):

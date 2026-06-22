@@ -40,6 +40,15 @@ def _capturing_run(returncode: int, stdout: str = "", stderr: str = ""):
     return _runner, calls
 
 
+def _raising_run(exc: Exception):
+    """每次调用都抛出给定异常的假 runner（模拟子进程起不来）。"""
+
+    def _runner(cmd, **kwargs):
+        raise exc
+
+    return _runner
+
+
 def _branch_then(branch: str, push_rc: int = 0, push_stderr: str = ""):
     """组合 runner：第 1 次调用（rev-parse）返回分支，其余返回 push 结果。"""
     state = {"n": 0}
@@ -76,25 +85,31 @@ def test_build_push_argv_without_upstream():
 
 
 def test_build_gh_argv_minimal():
-    assert _deliver.build_gh_argv(None, None, None, None, False) == ["gh", "pr", "create"]
+    assert _deliver.build_gh_argv(None, None, None, False) == ["gh", "pr", "create"]
 
 
 def test_build_gh_argv_title_and_body():
-    assert _deliver.build_gh_argv("My PR", "the body", None, None, False) == [
+    assert _deliver.build_gh_argv("My PR", "the body", None, False) == [
         "gh", "pr", "create", "--title", "My PR", "--body", "the body",
     ]
 
 
 def test_build_gh_argv_base_and_draft():
-    argv = _deliver.build_gh_argv("T", None, None, "develop", True)
+    argv = _deliver.build_gh_argv("T", None, "develop", True)
     assert "--base" in argv and argv[argv.index("--base") + 1] == "develop"
     assert "--draft" in argv
 
 
 def test_build_gh_argv_empty_body_still_passed():
     # body 为空串（已读取的空文件）仍应作为 --body 传入（区别于 None）
-    argv = _deliver.build_gh_argv("T", "", None, None, False)
+    argv = _deliver.build_gh_argv("T", "", None, False)
     assert "--body" in argv and argv[argv.index("--body") + 1] == ""
+
+
+def test_build_gh_argv_rejects_body_file_kwarg():
+    # body_file 已从签名移除：传它应当 TypeError（死参数不再被静默接受）
+    with pytest.raises(TypeError):
+        _deliver.build_gh_argv("T", None, None, False, body_file="x.md")
 
 
 # ============================================================
@@ -328,6 +343,107 @@ def test_pr_open_draft_and_base_flags_passed(tmp_path, make_args, capsys, monkey
     argv = calls[0]["cmd"]
     assert "--draft" in argv
     assert "--base" in argv and argv[argv.index("--base") + 1] == "develop"
+
+
+def test_push_runner_oserror_emits_json_not_crash(tmp_path, make_args, capsys, monkeypatch):
+    # 注入抛 OSError 的 runner（rev-parse 这一步就炸）→ 不崩，产结构化 JSON + exit 1
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(_deliver, "_resolve_repo_root", lambda args: repo)
+    monkeypatch.setattr(_deliver, "_which", lambda name: "/usr/bin/git")
+    runner = _raising_run(OSError("[Errno 2] No such file or directory: 'git'"))
+    with pytest.raises(SystemExit) as ei:
+        _deliver.run_push(make_args(remote=None, branch=None, set_upstream=True), runner=runner)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "subprocess_error"
+
+
+def test_push_runner_oserror_on_push_step(tmp_path, make_args, capsys, monkeypatch):
+    # 显式 branch → 跳过 rev-parse，push 那一步抛 OSError → 仍产 JSON 不崩
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(_deliver, "_resolve_repo_root", lambda args: repo)
+    monkeypatch.setattr(_deliver, "_which", lambda name: "/usr/bin/git")
+    runner = _raising_run(OSError("boom"))
+    with pytest.raises(SystemExit) as ei:
+        _deliver.run_push(make_args(remote="origin", branch="feat/x", set_upstream=True), runner=runner)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "subprocess_error"
+
+
+def test_pr_open_runner_timeout_emits_json_not_crash(tmp_path, make_args, capsys, monkeypatch):
+    # 注入抛 TimeoutExpired 的 runner → 不崩，产结构化 JSON + exit 1
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(_deliver, "_resolve_repo_root", lambda args: repo)
+    monkeypatch.setattr(_deliver, "_which", lambda name: "/usr/bin/gh")
+    runner = _raising_run(subprocess.TimeoutExpired(cmd="gh", timeout=5))
+    with pytest.raises(SystemExit) as ei:
+        _deliver.run_pr_open(
+            make_args(title="T", body=None, body_file=None, base=None, draft=False),
+            runner=runner,
+        )
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "subprocess_error"
+
+
+def test_push_failure_stderr_redacts_credentials(tmp_path, make_args, capsys, monkeypatch):
+    # push 失败 stderr 含内嵌凭据 → 输出已脱敏，绝不含原始 token
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(_deliver, "_resolve_repo_root", lambda args: repo)
+    monkeypatch.setattr(_deliver, "_which", lambda name: "/usr/bin/git")
+    leak = "fatal: unable to access 'https://tok123secret@github.com/o/r.git/': 403\n"
+    runner = _branch_then("feat/x", push_rc=1, push_stderr=leak)
+    with pytest.raises(SystemExit):
+        _deliver.run_push(make_args(remote=None, branch=None, set_upstream=True), runner=runner)
+    out = capsys.readouterr().out
+    assert "tok123secret" not in out
+    assert "<redacted>" in out
+
+
+def test_pr_open_failure_stderr_redacts_credentials(tmp_path, make_args, capsys, monkeypatch):
+    # gh 失败 stderr 含内嵌凭据 → 同样脱敏
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(_deliver, "_resolve_repo_root", lambda args: repo)
+    monkeypatch.setattr(_deliver, "_which", lambda name: "/usr/bin/gh")
+    leak = "error: https://ghp_supersecret@github.com remote rejected\n"
+    runner = _fake_run(1, stderr=leak)
+    with pytest.raises(SystemExit):
+        _deliver.run_pr_open(
+            make_args(title="T", body=None, body_file=None, base=None, draft=False),
+            runner=runner,
+        )
+    out = capsys.readouterr().out
+    assert "ghp_supersecret" not in out
+    assert "<redacted>" in out
+
+
+def test_pr_open_success_but_no_url_warns_and_raw(tmp_path, make_args, capsys, monkeypatch):
+    # gh 成功（rc 0）但 stdout 无 PR url → 不静默：pr_url=null + warn + raw_stdout_tail
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(_deliver, "_resolve_repo_root", lambda args: repo)
+    monkeypatch.setattr(_deliver, "_which", lambda name: "/usr/bin/gh")
+    runner = _fake_run(0, stdout="Warning: something odd, no url emitted\n")
+    _deliver.run_pr_open(
+        make_args(title="T", body=None, body_file=None, base=None, draft=False),
+        runner=runner,
+    )
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["ok"] is True
+    assert out["pr_url"] is None
+    assert "raw_stdout_tail" in out
+    assert "no url emitted" in out["raw_stdout_tail"]
+    # warn 走 stderr，给人工信号，绝不静默
+    assert "warn" in captured.err.lower()
 
 
 def test_cli_deliver_and_pr_open_delegate(tmp_path, make_args, capsys, monkeypatch):

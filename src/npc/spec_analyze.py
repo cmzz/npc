@@ -57,8 +57,9 @@ def parse_new_capabilities(proposal_text: str) -> list[str]:
             level = len(m_head.group(1))
             title = m_head.group(2).strip().lower()
             if not in_new_caps:
-                # 进入 New Capabilities 段（任意标题层级，匹配标题文本）
-                if title == "new capabilities" or title.startswith("new capabilities"):
+                # 进入 New Capabilities 段（任意标题层级，标题文本须精确匹配，
+                # 避免 `### New Capabilities Extended` 之类误激活收集）
+                if title == "new capabilities":
                     in_new_caps = True
                     new_caps_level = level
                 continue
@@ -116,15 +117,16 @@ def capability_mentioned_in_tasks(capability: str, tasks_text: str) -> bool:
     """粗粒度启发式：capability 名（或其分词）是否在 tasks.md 全文出现。
 
     把 capability 拆成 token（按非字母数字分割），只要任一非平凡 token
-    （长度 ≥ 3）出现在归一化后的 tasks 文本里就算 "提到"。这是有意宽松的
-    启发式（宁可漏报 finding 也少误报），调用方会标注 ``可能误报``。
+    （长度 ≥ 3）以词边界出现在归一化后的 tasks 文本里就算 "提到"。这是粗粒度
+    关键词覆盖启发式，可能误报或漏报，调用方会标注 ``可能误报``。
     """
     haystack = _normalize_for_match(tasks_text)
     tokens = [t for t in _normalize_for_match(capability).split() if len(t) >= 3]
     if not tokens:
-        # capability 名太短/无字母数字：退化为整体子串匹配
+        # capability 名太短/无字母数字：退化为整体词边界匹配
+        # （仍用空格包裹，避免 "no" 命中 "not" 这类子串误匹配）
         norm = _normalize_for_match(capability).strip()
-        return bool(norm) and norm in haystack
+        return bool(norm) and f" {norm} " in f" {haystack} "
     return any(f" {t} " in f" {haystack} " for t in tokens)
 
 
@@ -223,22 +225,24 @@ def analyze_change(change_dir: Path) -> dict:
             )
 
     # --- finding 4: requirement-maybe-uncovered（启发式）---
-    tasks_blob = tasks_text or ""
-    for cap, spec_txt in spec_caps.items():
-        reqs = parse_requirements(spec_txt)
-        if not reqs:
-            continue
-        if not capability_mentioned_in_tasks(cap, tasks_blob):
-            findings.append(
-                {
-                    "kind": "requirement-maybe-uncovered",
-                    "severity": "medium",
-                    "detail": (
-                        f"capability `{cap}` 有 {len(reqs)} 条 Requirement，但 tasks.md "
-                        f"未出现该 capability 关键词（启发式覆盖检查，可能误报）"
-                    ),
-                }
-            )
+    # 仅当 tasks 实际存在且有任务项时才做覆盖启发式：tasks 缺失/空时已由
+    # no-tasks(high) 覆盖，不再叠加误导性的 medium 噪声。
+    if tasks_text is not None and tasks_count > 0:
+        for cap, spec_txt in spec_caps.items():
+            reqs = parse_requirements(spec_txt)
+            if not reqs:
+                continue
+            if not capability_mentioned_in_tasks(cap, tasks_text):
+                findings.append(
+                    {
+                        "kind": "requirement-maybe-uncovered",
+                        "severity": "medium",
+                        "detail": (
+                            f"capability `{cap}` 有 {len(reqs)} 条 Requirement，但 tasks.md "
+                            f"未出现该 capability 关键词（启发式覆盖检查，可能误报）"
+                        ),
+                    }
+                )
 
     # --- finding 5: tasks-all-done（信息）---
     if tasks_count > 0 and all(t["done"] for t in tasks):

@@ -21,12 +21,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 from . import _io
 from . import paths as _paths
+
+
+# change-id 合法字符集：首字符必须是字母数字，其余允许 . _ -。
+# 既挡参数注入（前导 ``-`` 被下游当 flag），又挡路径遍历（``/`` 与 ``..``）。
+_CHANGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_safe_change_id(change: str) -> bool:
+    """change-id 必须匹配 ``^[A-Za-z0-9][A-Za-z0-9._-]*$`` 且不得为纯 ``.`` / ``..``。"""
+    if not _CHANGE_ID_RE.match(change):
+        return False
+    # ``.`` / ``..`` 不会匹配（首字符须字母数字），此处冗余保险。
+    if change in (".", ".."):
+        return False
+    return True
+
+
+def _is_injection_arg(value: str | None) -> bool:
+    """非 None 且以 ``-`` 开头 → 会被下游 CLI 误判为 flag（参数注入）。"""
+    return value is not None and value.startswith("-")
 
 
 # ============================================================
@@ -67,7 +88,7 @@ def _parse_status_payload(payload: dict, apply_requires: list[str]) -> list[str]
     （applyRequires 中 status != "done" 或根本不存在于 artifacts 的产物 id）。
     """
     artifacts = payload.get("artifacts") or []
-    status_by_id: dict[str, str] = {}
+    status_by_id: dict[str, str | None] = {}
     for item in artifacts:
         if not isinstance(item, dict):
             continue
@@ -92,6 +113,12 @@ def run_check(args: argparse.Namespace, runner=subprocess.run) -> None:
     if not change:
         _io.emit_error("invalid_args", "必须提供 --change", exit_code=2)
         return
+    # 参数注入防护：change 以 ``-`` 开头会被 openspec 当作 flag。在构造 argv 前挡。
+    if _is_injection_arg(change):
+        _io.emit_error(
+            "invalid_args", f"--change 不得以 '-' 开头（疑似参数注入）：{change!r}", exit_code=2
+        )
+        return
 
     phase = getattr(args, "phase", None) or "implement"
 
@@ -107,12 +134,18 @@ def run_check(args: argparse.Namespace, runner=subprocess.run) -> None:
         _io.emit_error("dependency_missing", str(e), exit_code=4)
         return
 
-    proc = runner(
-        [osp, "status", "--change", change, "--json"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = runner(
+            [osp, "status", "--change", change, "--json"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _io.emit_error(
+            "subprocess_error", f"openspec status 子进程执行失败：{e}", exit_code=1
+        )
+        return
     if proc.returncode != 0:
         _io.emit_error(
             "openspec_failed",
@@ -187,9 +220,27 @@ def run_new_change(args: argparse.Namespace, runner=subprocess.run) -> None:
     if not change:
         _io.emit_error("invalid_args", "必须提供 --change", exit_code=2)
         return
+    # change-id 强约束 ``^[A-Za-z0-9._-]+$``：同时挡参数注入（leading ``-``）与
+    # 路径遍历（``/`` / ``..``）。change_dir 直接由 change 拼接，必须先净化。
+    if not _is_safe_change_id(change):
+        _io.emit_error(
+            "invalid_args",
+            f"--change 仅允许字母数字与 . _ - （禁路径分隔/前导 '-'）：{change!r}",
+            exit_code=2,
+        )
+        return
 
     description = getattr(args, "description", None)
     schema = getattr(args, "schema", None)
+    # 参数注入防护：description / schema 以 ``-`` 开头会被 openspec 当作 flag。
+    for name, value in (("--description", description), ("--schema", schema)):
+        if _is_injection_arg(value):
+            _io.emit_error(
+                "invalid_args",
+                f"{name} 不得以 '-' 开头（疑似参数注入）：{value!r}",
+                exit_code=2,
+            )
+            return
 
     try:
         repo_root = _resolve_repo_root(args)
@@ -203,18 +254,38 @@ def run_new_change(args: argparse.Namespace, runner=subprocess.run) -> None:
         _io.emit_error("dependency_missing", str(e), exit_code=4)
         return
 
+    # change_dir 用于 scaffold 扫描与输出（保持与 repo_root 同源、不 resolve 以稳定输出）。
+    changes_root = repo_root / "openspec" / "changes"
+    change_dir = changes_root / change
+    # resolve 后纵深校验：即便 change-id 已净化，仍核对解析路径未越出边界。
+    resolved_root = changes_root.resolve()
+    resolved_dir = change_dir.resolve()
+    if resolved_dir != resolved_root and resolved_root not in resolved_dir.parents:
+        _io.emit_error(
+            "invalid_args",
+            f"change 目录越出 openspec/changes/ 边界：{resolved_dir}",
+            exit_code=2,
+        )
+        return
+
     cmd = [osp, "new", "change", change]
     if description:
         cmd += ["--description", description]
     if schema:
         cmd += ["--schema", schema]
 
-    proc = runner(
-        cmd,
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = runner(
+            cmd,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _io.emit_error(
+            "subprocess_error", f"openspec new change 子进程执行失败：{e}", exit_code=1
+        )
+        return
     if proc.returncode != 0:
         _io.emit_error(
             "openspec_failed",
@@ -223,7 +294,6 @@ def run_new_change(args: argparse.Namespace, runner=subprocess.run) -> None:
         )
         return
 
-    change_dir = repo_root / "openspec" / "changes" / change
     files = _scaffold_files(change_dir)
     _io.emit(
         {
